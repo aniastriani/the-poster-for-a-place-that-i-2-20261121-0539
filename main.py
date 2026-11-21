@@ -1,18 +1,19 @@
-"""Velmora — a travel poster for a place that does not exist.
+"""VELMORA — a travel poster for a place that isn't there.
 
-Draws one vintage-style travel poster (768x1024) and writes it to
+A vintage-style poster (768 x 1024) for the floating isles of Velmora,
+drawn entirely by this program and saved to
 $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
 
-The poster is painted entirely with code: a hand-rolled PNG writer
-(zlib + struct, no third-party libraries), a small canvas of drawing
-primitives (gradients, polygons, discs, lines), and a tiny 5x7 bitmap
-letter set for the place name. Nothing is read from disk, nothing is
-fetched from the network, and every number is a fixed constant, so
-every run produces byte-identical output.
+Everything is pure Python standard library: the PNG bytes are written
+by hand (zlib + struct), the picture is painted with a small set of
+drawing helpers on an RGB buffer, and the lettering comes from a tiny
+5-by-7 bitmap alphabet defined below. Nothing is read from disk and
+nothing touches the network, so two runs of this file produce
+byte-identical output.
 
-The place: VELMORA, the isles that drift — floating islands above a
-teal sea, a low gold sun, a crescent moon, a lighthouse, and one small
-sailboat on its way home.
+The scene: a low amber sun over a teal sea, drifting isles with pine
+trees and a lighthouse, a hot-air balloon crossing the dusk sky, and
+one small sailboat heading home.
 """
 
 import math
@@ -20,299 +21,340 @@ import os
 import struct
 import zlib
 
-# ---------------------------------------------------------------- output
+# ------------------------------------------------------------------- setup
 OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 OUT_PATH = os.path.join(OUT_DIR, "entry.png")
 
-W, H = 768, 1024          # final poster size
-SS = 2                    # supersample factor; drawn big, then averaged down
-IW, IH = W * SS, H * SS   # internal canvas size
+W, H = 768, 1024
+SS = 2                      # supersampling: paint big, average down
+IW, IH = W * SS, H * SS
 
-
-def s(v):
-    """Scale a final-coordinate value to internal coordinates."""
+def sc(v):
+    """Scale a poster coordinate up to internal canvas coordinates."""
     return v * SS
 
+# ----------------------------------------------------------------- palette
+PAL = {
+    "night":   (16, 20, 54),
+    "dusk":    (72, 52, 110),
+    "rose":    (198, 96, 86),
+    "amber":   (243, 178, 92),
+    "glow_a":  (247, 196, 110),
+    "glow_b":  (250, 214, 140),
+    "sun":     (255, 232, 178),
+    "cream":   (255, 243, 214),
+    "coral":   (232, 115, 90),
+    "ink":     (24, 28, 58),
+    "isle":    (30, 42, 74),
+    "pine":    (20, 53, 42),
+    "sea_hi":  (16, 84, 98),
+    "sea_lo":  (6, 38, 58),
+    "foam":    (207, 232, 234),
+    "beam":    (255, 233, 168),
+    "hull":    (20, 38, 63),
+    "glint":   (214, 164, 96),
+    "shimmer": (46, 120, 138),
+}
 
-# ---------------------------------------------------------------- palette
-INK = (24, 28, 58)            # deep indigo, outlines and shadow
-CREAM = (255, 243, 214)       # poster cream: frame, lettering, sails
-GOLD = (242, 180, 92)         # horizon gold
-SUN = (255, 233, 184)         # sun disc
-CORAL = (232, 115, 90)        # sunset coral
-VIOLET = (122, 78, 140)       # dusk violet
-INDIGO = (30, 36, 71)         # night-sky top
-ISLE = (30, 42, 74)           # island silhouette
-PINE = (20, 53, 42)           # pine green
-SEA_TOP = (14, 74, 90)        # sea at the horizon
-SEA_DEEP = (7, 42, 61)        # sea at the bottom edge
-FOAM = (207, 232, 234)        # waterfall foam
-BEAM = (255, 233, 168)        # lighthouse beam
-HULL = (20, 38, 63)           # sailboat hull
+def mix(c1, c2, t):
+    """Blend two RGB triples."""
+    return tuple(int(round(c1[i] + (c2[i] - c1[i]) * t)) for i in range(3))
 
-
-def lerp(a, b, t):
-    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
-
-
-# ---------------------------------------------------------------- canvas
-class Canvas:
-    """A plain RGB canvas with a few flat-colour drawing primitives."""
+# ------------------------------------------------------------------ canvas
+class Surface:
+    """An RGB pixel buffer with flat-colour drawing helpers."""
 
     def __init__(self, width, height):
         self.w = width
         self.h = height
-        self.px = bytearray(width * height * 3)
+        self.buf = bytearray(width * height * 3)
 
-    def _off(self, x, y):
+    def _at(self, x, y):
         return (y * self.w + x) * 3
 
-    def dot(self, x, y, color):
+    def put(self, x, y, colour):
         if 0 <= x < self.w and 0 <= y < self.h:
-            o = self._off(x, y)
-            self.px[o:o + 3] = bytes(color)
+            o = self._at(x, y)
+            self.buf[o:o + 3] = bytes(colour)
 
-    def rect(self, x0, y0, x1, y1, color):
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        x1 = min(self.w, x1)
-        y1 = min(self.h, y1)
-        row = bytes(color) * (x1 - x0)
-        for y in range(y0, y1):
-            o = self._off(x0, y)
-            self.px[o:o + len(row)] = row
-
-    def hspan(self, x0, x1, y, color):
-        if y < 0 or y >= self.h:
+    def fill(self, x0, y0, x1, y1, colour):
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(self.w, x1); y1 = min(self.h, y1)
+        if x1 <= x0 or y1 <= y0:
             return
-        self.rect(x0, y, x1, y + 1, color)
+        row = bytes(colour) * (x1 - x0)
+        for y in range(y0, y1):
+            o = self._at(x0, y)
+            self.buf[o:o + len(row)] = row
 
-    def vgrad(self, y0, y1, stops):
-        """Vertical gradient; stops is a list of (y, color) pairs."""
+    def span(self, x0, x1, y, colour):
+        self.fill(x0, y, x1, y + 1, colour)
+
+    def sky(self, y0, y1, stops):
+        """Paint a vertical gradient between (y, colour) stops."""
         for y in range(max(0, y0), min(self.h, y1)):
             for i in range(len(stops) - 1):
                 ya, ca = stops[i]
                 yb, cb = stops[i + 1]
                 if ya <= y <= yb and yb > ya:
-                    self.hspan(0, self.w, y, lerp(ca, cb, (y - ya) / (yb - ya)))
+                    self.span(0, self.w, y, mix(ca, cb, (y - ya) / (yb - ya)))
                     break
             else:
-                self.hspan(0, self.w, y, stops[-1][1])
+                self.span(0, self.w, y, stops[-1][1])
 
-    def disc(self, cx, cy, r, color):
+    def disc(self, cx, cy, r, colour):
         for dy in range(-r, r + 1):
-            dx = int(math.sqrt(max(0, r * r - dy * dy)))
-            self.hspan(cx - dx, cx + dx + 1, cy + dy, color)
+            half = int(math.sqrt(max(0, r * r - dy * dy)))
+            self.span(cx - half, cx + half + 1, cy + dy, colour)
 
-    def ellipse(self, cx, cy, rx, ry, color):
+    def oval(self, cx, cy, rx, ry, colour):
         for dy in range(-ry, ry + 1):
-            t = 1.0 - (dy * dy) / float(ry * ry)
-            dx = int(rx * math.sqrt(max(0.0, t)))
-            self.hspan(cx - dx, cx + dx + 1, cy + dy, color)
+            frac = 1.0 - (dy * dy) / float(ry * ry)
+            half = int(rx * math.sqrt(max(0.0, frac)))
+            self.span(cx - half, cx + half + 1, cy + dy, colour)
 
-    def poly(self, points, color):
-        """Scanline-filled polygon; points are (x, y) pairs."""
-        if len(points) < 3:
+    def fill_poly(self, pts, colour):
+        """Scanline fill for a simple polygon given as (x, y) pairs."""
+        if len(pts) < 3:
             return
-        ys = [p[1] for p in points]
+        ys = [p[1] for p in pts]
         for y in range(max(0, min(ys)), min(self.h, max(ys) + 1)):
-            xs = []
-            for i in range(len(points)):
-                x0, y0 = points[i]
-                x1, y1 = points[(i + 1) % len(points)]
+            hits = []
+            for i in range(len(pts)):
+                x0, y0 = pts[i]
+                x1, y1 = pts[(i + 1) % len(pts)]
                 if (y0 <= y < y1) or (y1 <= y < y0):
-                    t = (y - y0) / float(y1 - y0)
-                    xs.append(int(x0 + t * (x1 - x0)))
-            xs.sort()
-            for i in range(0, len(xs) - 1, 2):
-                self.hspan(xs[i], xs[i + 1] + 1, y, color)
+                    hits.append(int(x0 + (y - y0) / float(y1 - y0) * (x1 - x0)))
+            hits.sort()
+            for i in range(0, len(hits) - 1, 2):
+                self.span(hits[i], hits[i + 1] + 1, y, colour)
 
-    def line(self, x0, y0, x1, y1, color, width=1):
+    def segment(self, x0, y0, x1, y1, colour, width=1):
         steps = max(abs(x1 - x0), abs(y1 - y0), 1)
         for i in range(steps + 1):
             t = i / float(steps)
             x = int(round(x0 + (x1 - x0) * t))
             y = int(round(y0 + (y1 - y0) * t))
-            self.rect(x - width // 2, y - width // 2,
-                      x + width // 2 + 1, y + width // 2 + 1, color)
+            self.fill(x - width // 2, y - width // 2,
+                      x + width // 2 + 1, y + width // 2 + 1, colour)
 
-    def ring(self, cx, cy, r, color, width=1):
-        for dy in range(-r - width, r + width + 1):
-            for dx in range(-r - width, r + width + 1):
-                d = math.sqrt(dx * dx + dy * dy)
-                if r - width <= d <= r + width:
-                    self.dot(cx + dx, cy + dy, color)
+    def diamond(self, cx, cy, r, colour):
+        self.fill_poly([(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)],
+                       colour)
 
-
-# ------------------------------------------------------- deterministic dice
-class Dice:
-    """A tiny fixed-seed generator; the poster never changes between runs."""
+# ------------------------------------------------------------ fixed random
+class Rng:
+    """Deterministic linear-congruential generator (fixed seed)."""
 
     def __init__(self, seed):
         self.state = seed & 0x7FFFFFFF
 
-    def next(self, n):
+    def below(self, n):
         self.state = (1103515245 * self.state + 12345) & 0x7FFFFFFF
         return self.state % n
 
-
-# ------------------------------------------------------------- bitmap font
-# 5x7 letters, drawn from '#' rows. Only the letters VELMORA are needed.
-GLYPHS = {
-    "V": ("#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "),
+# -------------------------------------------------------------- bitmap type
+# A hand-drawn 5-wide, 7-tall alphabet. "#" is ink, " " is empty.
+FONT = {
+    "A": (" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"),
+    "B": ("#### ", "#   #", "#   #", "#### ", "#   #", "#   #", "#### "),
+    "C": (" ### ", "#   #", "#    ", "#    ", "#    ", "#   #", " ### "),
+    "D": ("#### ", "#   #", "#   #", "#   #", "#   #", "#   #", "#### "),
     "E": ("#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####"),
+    "F": ("#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#    "),
+    "G": (" ### ", "#   #", "#    ", "# ###", "#   #", "#   #", " ### "),
+    "H": ("#   #", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"),
+    "I": (" ### ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", " ### "),
+    "J": ("  ###", "   # ", "   # ", "   # ", "   # ", "#  # ", " ##  "),
+    "K": ("#   #", "#  # ", "# #  ", "##   ", "# #  ", "#  # ", "#   #"),
     "L": ("#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"),
     "M": ("#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"),
+    "N": ("#   #", "##  #", "# # #", "#  ##", "#   #", "#   #", "#   #"),
     "O": (" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "),
-    "R": ("#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#   #"),
-    "A": (" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"),
+    "P": ("#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    "),
+    "Q": (" ### ", "#   #", "#   #", "#   #", "# # #", "#  # ", " ## #"),
+    "R": ("#### ", "#   #", "#   #", "#### ", "# #  ", "#  # ", "#   #"),
+    "S": (" ####", "#    ", "#    ", " ### ", "    #", "    #", "#### "),
+    "T": ("#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  "),
+    "U": ("#   #", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "),
+    "V": ("#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "),
+    "W": ("#   #", "#   #", "#   #", "# # #", "# # #", "## ##", "#   #"),
+    "X": ("#   #", "#   #", " # # ", "  #  ", " # # ", "#   #", "#   #"),
+    "Y": ("#   #", "#   #", " # # ", "  #  ", "  #  ", "  #  ", "  #  "),
+    "Z": ("#####", "    #", "   # ", "  #  ", " #   ", "#    ", "#####"),
     " ": ("     ", "     ", "     ", "     ", "     ", "     ", "     "),
+    "-": ("     ", "     ", "     ", "#####", "     ", "     ", "     "),
+    ".": ("     ", "     ", "     ", "     ", "     ", " ##  ", " ##  "),
 }
 
-
-def draw_text(cv, text, x, y, scale, color):
-    """Draw text with the bitmap font; returns the width in pixels."""
+def blit_text(cv, text, x, y, scale, colour):
+    """Stamp bitmap text onto the canvas; returns the drawn width."""
     cx = x
     for ch in text:
-        glyph = GLYPHS.get(ch, GLYPHS[" "])
+        glyph = FONT.get(ch, FONT[" "])
         for row in range(7):
             for col in range(5):
                 if glyph[row][col] == "#":
-                    cv.rect(cx + col * scale, y + row * scale,
+                    cv.fill(cx + col * scale, y + row * scale,
                             cx + (col + 1) * scale, y + (row + 1) * scale,
-                            color)
+                            colour)
         cx += 6 * scale
     return cx - x - scale
 
-
-def text_width(text, scale):
+def text_w(text, scale):
     return len(text) * 6 * scale - scale
 
+# ------------------------------------------------------------------- scene
+def build_poster():
+    cv = Surface(IW, IH)
+    rng = Rng(20261121)
+    P = PAL
 
-# ------------------------------------------------------------------ poster
-def paint():
-    cv = Canvas(IW, IH)
-    dice = Dice(20261121)
-
-    # --- sky: indigo at the top, violet, coral, gold at the horizon.
-    cv.vgrad(0, s(640), [
-        (0, INDIGO),
-        (s(300), VIOLET),
-        (s(480), CORAL),
-        (s(640), GOLD),
+    # --- dusk sky, deep indigo at the top warming to amber at the sea.
+    cv.sky(0, sc(620), [
+        (0, P["night"]),
+        (sc(280), P["dusk"]),
+        (sc(470), P["rose"]),
+        (sc(620), P["amber"]),
     ])
 
-    # --- stars in the upper sky.
-    for _ in range(110):
-        x = 30 + dice.next(W - 60)
-        y = 40 + dice.next(420)
-        r = 1 + dice.next(2)
-        tone = 200 + dice.next(56)
-        cv.disc(s(x), s(y), s(r), (tone, tone, min(255, tone + 20)))
-        if dice.next(5) == 0:  # a few four-point sparkles
-            cv.line(s(x - 4), s(y), s(x + 4), s(y), (tone, tone, 240), s(1))
-            cv.line(s(x), s(y - 4), s(x), s(y + 4), (tone, tone, 240), s(1))
+    # --- stars scattered through the upper sky.
+    for _ in range(90):
+        x = 30 + rng.below(W - 60)
+        y = 30 + rng.below(360)
+        r = 1 + rng.below(2)
+        tone = 200 + rng.below(56)
+        cv.disc(sc(x), sc(y), sc(r), (tone, tone, min(255, tone + 20)))
+        if rng.below(5) == 0:  # a few four-point sparkles
+            cv.segment(sc(x - 4), sc(y), sc(x + 4), sc(y), (tone, tone, 240), sc(1))
+            cv.segment(sc(x), sc(y - 4), sc(x), sc(y + 4), (tone, tone, 240), sc(1))
 
-    # --- low sun with a warm glow, sitting just right of centre.
-    cv.disc(s(470), s(600), s(150), (247, 200, 115))
-    cv.disc(s(470), s(600), s(118), (249, 211, 138))
-    cv.disc(s(470), s(600), s(88), SUN)
+    # --- low amber sun, left of centre, with a soft glow. It sits low
+    # enough that its lower half shows beneath the great isle.
+    cv.disc(sc(200), sc(585), sc(150), P["glow_a"])
+    cv.disc(sc(200), sc(585), sc(115), P["glow_b"])
+    cv.disc(sc(200), sc(585), sc(85), P["sun"])
 
     # --- crescent moon, upper right.
-    cv.disc(s(636), s(128), s(34), CREAM)
-    cv.disc(s(650), s(118), s(30), (64, 52, 96))
+    cv.disc(sc(640), sc(120), sc(30), P["cream"])
+    cv.disc(sc(654), sc(110), sc(26), (64, 52, 96))
 
-    # --- birds: five small shallow chevrons in the sky.
-    for bx, by in [(180, 250), (240, 210), (560, 300), (610, 260), (300, 330)]:
-        cv.line(s(bx - 10), s(by), s(bx), s(by + 7), INK, s(2))
-        cv.line(s(bx), s(by + 7), s(bx + 10), s(by), INK, s(2))
+    # --- a hot-air balloon drifting across the dusk sky.
+    cv.oval(sc(600), sc(300), sc(46), sc(54), P["coral"])
+    cv.segment(sc(588), sc(352), sc(592), sc(372), P["ink"], sc(2))
+    cv.segment(sc(612), sc(352), sc(608), sc(372), P["ink"], sc(2))
+    cv.fill(sc(588), sc(372), sc(612), sc(390), P["hull"])
+    cv.segment(sc(600), sc(300), sc(600), sc(352), P["cream"], sc(2))
 
-    # --- sea: teal gradient from the horizon to the bottom edge.
-    cv.vgrad(s(640), IH, [
-        (s(640), SEA_TOP),
-        (IH, SEA_DEEP),
+    # --- birds: six shallow chevrons in the sky.
+    for bx, by in [(150, 220), (205, 180), (330, 250), (470, 200), (520, 160), (390, 300)]:
+        cv.segment(sc(bx - 10), sc(by), sc(bx), sc(by + 7), P["ink"], sc(2))
+        cv.segment(sc(bx), sc(by + 7), sc(bx + 10), sc(by), P["ink"], sc(2))
+
+    # --- the sea: teal, deepening toward the bottom edge.
+    cv.sky(sc(620), IH, [
+        (sc(620), P["sea_hi"]),
+        (IH, P["sea_lo"]),
     ])
 
-    # --- sun glitter on the water: short gold dashes under the sun.
-    for i in range(26):
-        x = 380 + dice.next(190)
-        y = 660 + dice.next(300)
-        w = 18 + dice.next(46)
-        cv.rect(s(x), s(y), s(x + w), s(y + 3), (214, 164, 96))
+    # --- gold glitter on the water beneath the sun.
+    for _ in range(26):
+        x = 120 + rng.below(200)
+        y = 640 + rng.below(300)
+        w = 18 + rng.below(46)
+        cv.fill(sc(x), sc(y), sc(x + w), sc(y + 3), P["glint"])
 
-    # --- sea shimmer: pale teal dashes scattered across the water.
+    # --- pale teal shimmer scattered across the rest of the water.
     for _ in range(70):
-        x = 40 + dice.next(W - 90)
-        y = 680 + dice.next(300)
-        w = 12 + dice.next(40)
-        cv.rect(s(x), s(y), s(x + w), s(y + 2), (46, 120, 138))
+        x = 40 + rng.below(W - 90)
+        y = 660 + rng.below(320)
+        w = 12 + rng.below(40)
+        cv.fill(sc(x), sc(y), sc(x + w), sc(y + 2), P["shimmer"])
 
-    # --- the great floating isle, left of centre, with pines and a light.
-    isle = [(70, 470), (150, 430), (260, 415), (360, 440), (400, 480),
-            (385, 545), (340, 600), (300, 615), (250, 590), (190, 600),
-            (120, 570), (80, 520)]
-    cv.poly([(s(x), s(y)) for x, y in isle], ISLE)
-    for tx, ty, th in [(150, 428, 26), (215, 422, 32), (285, 426, 24)]:
-        cv.poly([(s(tx - 14), s(ty)), (s(tx), s(ty - th)),
-                 (s(tx + 14), s(ty))], PINE)
-    # lighthouse: cream tower, dark cap, and a beam reaching right.
-    cv.rect(s(322), s(392), s(336), s(432), CREAM)
-    cv.poly([(s(318), s(392)), (s(340), s(392)), (s(329), s(378))], INK)
-    cv.poly([(s(336), s(402)), (s(560), s(360)), (s(560), s(420))], BEAM)
-    cv.disc(s(329), s(400), s(5), SUN)
+    # --- the great drifting isle, centre-left: a flat top that tapers
+    # to a point underneath, with pines and a lighthouse on top.
+    isle = [(110, 470), (190, 430), (300, 418), (380, 445), (395, 480),
+            (360, 540), (300, 585), (250, 600), (210, 565), (150, 540),
+            (105, 510)]
+    cv.fill_poly([(sc(x), sc(y)) for x, y in isle], P["isle"])
+    for tx, ty, th in [(160, 428, 36), (235, 418, 44), (305, 428, 34)]:
+        cv.fill_poly([(sc(tx - 16), sc(ty)), (sc(tx), sc(ty - th)),
+                      (sc(tx + 16), sc(ty))], P["pine"])
+    # lighthouse: cream tower, dark cap, and a narrow beam sweeping left.
+    cv.fill(sc(350), sc(380), sc(364), sc(420), P["cream"])
+    cv.fill_poly([(sc(346), sc(380)), (sc(368), sc(380)), (sc(357), sc(366))],
+                 P["ink"])
+    cv.fill_poly([(sc(350), sc(388)), (sc(150), sc(376)), (sc(150), sc(398))],
+                 P["beam"])
+    cv.disc(sc(357), sc(388), sc(5), P["sun"])
 
-    # --- the smaller isle, right, with a waterfall spilling into the sea.
-    small = [(540, 520), (600, 495), (680, 510), (700, 550),
-             (665, 585), (600, 595), (560, 560)]
-    cv.poly([(s(x), s(y)) for x, y in small], ISLE)
-    cv.poly([(s(612), s(500)), (s(600), s(472)), (s(624), s(472))], PINE)
+    # --- the smaller isle, right, tapering to a point with a waterfall
+    # spilling from its tip into the sea.
+    small = [(545, 505), (610, 480), (690, 498), (700, 535),
+             (665, 570), (625, 588), (590, 560), (555, 535)]
+    cv.fill_poly([(sc(x), sc(y)) for x, y in small], P["isle"])
+    cv.fill_poly([(sc(612), sc(500)), (sc(600), sc(472)), (sc(624), sc(472))],
+                 P["pine"])
     for k in range(46):  # the fall, leaning gently as it drops
-        y = 595 + k
-        x = 620 + int(6 * math.sin(k / 9.0))
-        cv.rect(s(x - 5), s(y), s(x + 5), s(y + 1), FOAM)
-    cv.ellipse(s(622), s(644), s(26), s(7), FOAM)
+        y = 588 + k
+        x = 625 + int(6 * math.sin(k / 9.0))
+        cv.fill(sc(x - 5), sc(y), sc(x + 5), sc(y + 1), P["foam"])
+    cv.oval(sc(627), sc(640), sc(26), sc(7), P["foam"])
 
     # --- a distant islet with a single tree, centre frame.
-    cv.poly([(s(430), s(560)), (s(470), s(545)), (s(510), s(560)),
-             (s(495), s(585)), (s(450), s(585))], ISLE)
-    cv.poly([(s(462), s(548)), (s(470), s(524)), (s(478), s(548))], PINE)
+    cv.fill_poly([(sc(440), sc(560)), (sc(470), sc(545)), (sc(510), sc(560)),
+                  (sc(495), sc(580)), (sc(470), sc(592)), (sc(450), sc(580))],
+                 P["isle"])
+    cv.fill_poly([(sc(462), sc(548)), (sc(470), sc(524)), (sc(478), sc(548))],
+                 P["pine"])
 
-    # --- one small sailboat on its way home.
-    cv.poly([(s(500), s(800)), (s(540), s(800)), (s(530), s(818)),
-             (s(508), s(818))], HULL)
-    cv.line(s(520), s(800), s(520), s(748), INK, s(2))
-    cv.poly([(s(522), s(752)), (s(522), s(798)), (s(548), s(798))], CREAM)
-    cv.poly([(s(518), s(760)), (s(518), s(798)), (s(498), s(798))], CREAM)
-    cv.ellipse(s(520), s(824), s(30), s(4), (120, 170, 180))
+    # --- one small sailboat heading home, lower right.
+    cv.fill_poly([(sc(560), sc(830)), (sc(600), sc(830)), (sc(590), sc(848)),
+                  (sc(568), sc(848))], P["hull"])
+    cv.segment(sc(580), sc(830), sc(580), sc(778), P["ink"], sc(2))
+    cv.fill_poly([(sc(582), sc(782)), (sc(582), sc(828)), (sc(608), sc(828))],
+                 P["cream"])
+    cv.fill_poly([(sc(578), sc(790)), (sc(578), sc(828)), (sc(558), sc(828))],
+                 P["cream"])
+    cv.oval(sc(580), sc(854), sc(30), sc(4), (120, 170, 180))
 
     # --- double cream frame.
-    cv.ring(s(0), s(0), 0, CREAM)  # no-op guard: keeps the frame code below tidy
-    for inset, width in [(18, 4), (30, 2)]:
-        i, w = s(inset), s(width)
-        cv.rect(i, i, IW - i, i + w, CREAM)
-        cv.rect(i, IH - i - w, IW - i, IH - i, CREAM)
-        cv.rect(i, i, i + w, IH - i, CREAM)
-        cv.rect(IW - i - w, i, IW - i, IH - i, CREAM)
+    for inset, width in [(16, 5), (28, 2)]:
+        i, w = sc(inset), sc(width)
+        cv.fill(i, i, IW - i, i + w, P["cream"])
+        cv.fill(i, IH - i - w, IW - i, IH - i, P["cream"])
+        cv.fill(i, i, i + w, IH - i, P["cream"])
+        cv.fill(IW - i - w, i, IW - i, IH - i, P["cream"])
 
-    # --- the place name, big and legible, with a soft shadow.
+    # --- the place name, big and legible, with a soft shadow. Text is
+    # drawn in internal canvas coordinates, so sizes scale by SS too.
     name = "VELMORA"
-    scale = 9
-    tw = text_width(name, scale)
-    tx = (W - tw) // 2
-    ty = 96
-    draw_text(cv, name, tx + 3, ty + 4, scale, INK)
-    draw_text(cv, name, tx, ty, scale, CREAM)
-    # a thin rule and two diamonds beneath the name
-    cv.rect(s(tx - 10), s(186), s(tx + tw + 10), s(189), CREAM)
-    for dx in (tx - 34, tx + tw + 34):
-        cv.poly([(s(dx), s(178)), (s(dx + 7), s(187)),
-                 (s(dx), s(196)), (s(dx - 7), s(187))], CREAM)
+    scale = 9 * SS
+    tw = text_w(name, scale)
+    tx = (IW - tw) // 2
+    ty = sc(92)
+    blit_text(cv, name, tx + 6, ty + 8, scale, P["ink"])
+    blit_text(cv, name, tx, ty, scale, P["cream"])
+    # a thin rule, two diamonds, and the tagline beneath the name
+    cv.fill(sc(tx // SS - 10), sc(168), sc(tx // SS + tw // SS + 10), sc(171),
+            P["cream"])
+    for dx in (tx // SS - 34, tx // SS + tw // SS + 34):
+        cv.diamond(sc(dx), sc(169), sc(7), P["cream"])
+    tag = "THE ISLES THAT DRIFT"
+    tscale = 4 * SS
+    ttw = text_w(tag, tscale)
+    blit_text(cv, tag, (IW - ttw) // 2, sc(192), tscale, P["cream"])
+
+    # --- small line at the foot of the poster.
+    foot = "SAIL THE SKY - NO MAP REQUIRED"
+    fscale = 3 * SS
+    ftw = text_w(foot, fscale)
+    blit_text(cv, foot, (IW - ftw) // 2, sc(948), fscale, P["cream"])
 
     return cv
 
-
-def downsample(cv):
-    """Average each 2x2 block of the big canvas into the final pixels."""
+def shrink(cv):
+    """Average each SS x SS block of the big canvas into final pixels."""
     out = bytearray(W * H * 3)
     for y in range(H):
         for x in range(W):
@@ -321,17 +363,17 @@ def downsample(cv):
                 base = ((y * SS + dy) * IW + x * SS) * 3
                 for dx in range(SS):
                     o = base + dx * 3
-                    acc[0] += cv.px[o]
-                    acc[1] += cv.px[o + 1]
-                    acc[2] += cv.px[o + 2]
+                    acc[0] += cv.buf[o]
+                    acc[1] += cv.buf[o + 1]
+                    acc[2] += cv.buf[o + 2]
             o = (y * W + x) * 3
-            out[o] = (acc[0] + 2) // 4
-            out[o + 1] = (acc[1] + 2) // 4
-            out[o + 2] = (acc[2] + 2) // 4
+            n = SS * SS
+            out[o] = (acc[0] + n // 2) // n
+            out[o + 1] = (acc[1] + n // 2) // n
+            out[o + 2] = (acc[2] + n // 2) // n
     return bytes(out)
 
-
-def png_bytes(rgb, width, height):
+def to_png(rgb, width, height):
     """Encode raw RGB bytes as a PNG (filter 0, zlib level 9)."""
     raw = bytearray()
     stride = width * 3
@@ -349,14 +391,12 @@ def png_bytes(rgb, width, height):
             + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
             + chunk(b"IEND", b""))
 
-
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    data = png_bytes(downsample(paint()), W, H)
+    data = to_png(shrink(build_poster()), W, H)
     with open(OUT_PATH, "wb") as f:
         f.write(data)
     print("wrote %s (%d bytes, %dx%d)" % (OUT_PATH, len(data), W, H))
-
 
 if __name__ == "__main__":
     main()
